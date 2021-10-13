@@ -159,9 +159,21 @@ pub struct RebasePlanBuilder<'repo> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Constraint {
-    parent_oid: NonZeroOid,
-    child_oid: NonZeroOid,
+enum Constraint {
+    /// Indicates that `child` should be moved on top of `parent`. Any
+    /// descendants of `child` should be reparented using one of this commit's
+    /// unmoved ancestors.
+    ImmediateChild {
+        parent_oid: NonZeroOid,
+        child_oid: NonZeroOid,
+    },
+
+    /// Indicates that `child` and all of its descendants should be moved on top
+    /// of `parent`.
+    ChildAndDescendants {
+        parent_oid: NonZeroOid,
+        child_oid: NonZeroOid,
+    },
 }
 
 /// Options used to build a rebase plan.
@@ -457,7 +469,7 @@ impl<'repo> RebasePlanBuilder<'repo> {
             .intersection(visible_commits);
         let children_oids = commit_set_to_vec(&children_oids)?;
         for child_oid in children_oids {
-            acc.push(Constraint {
+            acc.push(Constraint::ChildAndDescendants {
                 parent_oid: current_oid,
                 child_oid,
             });
@@ -565,7 +577,7 @@ impl<'repo> RebasePlanBuilder<'repo> {
                 state.constraints[&unconstrained_oid]
                     .iter()
                     .copied()
-                    .map(move |child_oid| Constraint {
+                    .map(move |child_oid| Constraint::ChildAndDescendants {
                         parent_oid: unconstrained_oid,
                         child_oid,
                     })
