@@ -119,7 +119,7 @@ impl ToString for RebaseCommand {
 struct BuildState {
     /// Copy of `initial_constraints` in `RebasePlanBuilder` but with any
     /// implied constraints added (such as for descendant commits).
-    constraints: HashMap<NonZeroOid, HashSet<NonZeroOid>>,
+    constraint_graph: HashMap<NonZeroOid, HashSet<NonZeroOid>>,
 
     /// The set of all commits which need to be rebased. Consequently, their
     /// OIDs will change.
@@ -148,9 +148,8 @@ struct BuildState {
 pub struct RebasePlanBuilder<'repo> {
     dag: &'repo Dag,
 
-    /// There is a mapping from from `x` to `y` if `x` must be applied before
-    /// `y`.
-    initial_constraints: HashMap<NonZeroOid, HashSet<NonZeroOid>>,
+    /// The constraints specified by the caller.
+    initial_constraints: Vec<Constraint>,
 
     /// Cache mapping from commit OID to the paths changed in the diff for that
     /// commit. The value is `None` if the commit doesn't have an associated
@@ -161,8 +160,8 @@ pub struct RebasePlanBuilder<'repo> {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Constraint {
     /// Indicates that `child` should be moved on top of `parent`. Any
-    /// descendants of `child` should be reparented using one of this commit's
-    /// unmoved ancestors.
+    /// descendants of `child` should be reparented using this commit's nearest
+    /// unmoved ancestor.
     ImmediateChild {
         parent_oid: NonZeroOid,
         child_oid: NonZeroOid,
@@ -340,16 +339,20 @@ impl<'repo> RebasePlanBuilder<'repo> {
                     })
                     .collect();
 
-                if let Some(commits_to_merge) = commits_to_merge {
-                    // All parents have been committed.
-                    acc.push(RebaseCommand::Merge {
-                        commit_oid: current_commit.get_oid(),
-                        commits_to_merge,
-                    });
-                } else {
-                    // Wait for the caller to come back to this commit
-                    // later and then proceed to any child commits.
-                    return Ok(acc);
+                match commits_to_merge {
+                    Some(commits_to_merge) => {
+                        // All parents have been committed.
+                        acc.push(RebaseCommand::Merge {
+                            commit_oid: current_commit.get_oid(),
+                            commits_to_merge,
+                        });
+                    }
+
+                    None => {
+                        // Wait for the caller to come back to this commit
+                        // later and then proceed to any child commits.
+                        return Ok(acc);
+                    }
                 }
             } else {
                 // Normal one-parent commit (or a zero-parent commit?), just
@@ -366,7 +369,7 @@ impl<'repo> RebasePlanBuilder<'repo> {
 
         let child_commits: Vec<Commit> = {
             let mut child_oids: Vec<NonZeroOid> = state
-                .constraints
+                .constraint_graph
                 .entry(current_commit.get_oid())
                 .or_default()
                 .iter()
@@ -449,9 +452,10 @@ impl<'repo> RebasePlanBuilder<'repo> {
         dest_oid: NonZeroOid,
     ) -> eyre::Result<()> {
         self.initial_constraints
-            .entry(dest_oid)
-            .or_default()
-            .insert(source_oid);
+            .push(Constraint::ChildAndDescendants {
+                parent_oid: dest_oid,
+                child_oid: source_oid,
+            });
         Ok(())
     }
 
@@ -502,7 +506,12 @@ impl<'repo> RebasePlanBuilder<'repo> {
             let visible_commits = self.dag.query().ancestors(active_heads)?;
 
             let mut acc = Vec::new();
-            let parents = state.constraints.values().flatten().cloned().collect_vec();
+            let parents = state
+                .constraint_graph
+                .values()
+                .flatten()
+                .cloned()
+                .collect_vec();
             progress.notify_progress(0, parents.len());
             for parent_oid in parents {
                 self.collect_descendants(&visible_commits, &mut acc, parent_oid)?;
@@ -510,18 +519,28 @@ impl<'repo> RebasePlanBuilder<'repo> {
             }
             acc
         };
-        for Constraint {
-            parent_oid,
-            child_oid,
-        } in all_descendants_of_constrained_nodes
-        {
-            state
-                .constraints
-                .entry(parent_oid)
-                .or_default()
-                .insert(child_oid);
+
+        for constraint in all_descendants_of_constrained_nodes {
+            match constraint {
+                Constraint::ImmediateChild {
+                    parent_oid,
+                    child_oid,
+                } => todo!(),
+
+                Constraint::ChildAndDescendants {
+                    parent_oid,
+                    child_oid,
+                } => {
+                    state
+                        .constraint_graph
+                        .entry(parent_oid)
+                        .or_default()
+                        .insert(child_oid);
+                }
+            }
         }
-        state.commits_to_move = state.constraints.values().flatten().copied().collect();
+
+        state.commits_to_move = state.constraint_graph.values().flatten().copied().collect();
         Ok(())
     }
 
@@ -539,7 +558,7 @@ impl<'repo> RebasePlanBuilder<'repo> {
         }
 
         path.push(current_oid);
-        if let Some(child_oids) = state.constraints.get(&current_oid) {
+        if let Some(child_oids) = state.constraint_graph.get(&current_oid) {
             for child_oid in child_oids.iter().sorted() {
                 self.check_for_cycles_helper(state, path, *child_oid)?;
             }
@@ -556,7 +575,7 @@ impl<'repo> RebasePlanBuilder<'repo> {
         let _effects = effects;
 
         // FIXME: O(n^2) algorithm.
-        for oid in state.constraints.keys().sorted() {
+        for oid in state.constraint_graph.keys().sorted() {
             self.check_for_cycles_helper(state, &mut Vec::new(), *oid)?;
         }
         Ok(())
@@ -565,8 +584,8 @@ impl<'repo> RebasePlanBuilder<'repo> {
     fn find_roots(&self, state: &BuildState) -> Vec<Constraint> {
         let unconstrained_nodes = {
             let mut unconstrained_nodes: HashSet<NonZeroOid> =
-                state.constraints.keys().copied().collect();
-            for child_oid in state.constraints.values().flatten() {
+                state.constraint_graph.keys().copied().collect();
+            for child_oid in state.constraint_graph.values().flatten() {
                 unconstrained_nodes.remove(child_oid);
             }
             unconstrained_nodes
@@ -574,7 +593,7 @@ impl<'repo> RebasePlanBuilder<'repo> {
         let mut root_edges: Vec<Constraint> = unconstrained_nodes
             .into_iter()
             .flat_map(|unconstrained_oid| {
-                state.constraints[&unconstrained_oid]
+                state.constraint_graph[&unconstrained_oid]
                     .iter()
                     .copied()
                     .map(move |child_oid| Constraint::ChildAndDescendants {
@@ -591,11 +610,11 @@ impl<'repo> RebasePlanBuilder<'repo> {
         state: &BuildState,
     ) -> Vec<(&NonZeroOid, Vec<&NonZeroOid>)> {
         state
-            .constraints
+            .constraint_graph
             .iter()
-            .map(|(k, v)| (k, v.iter().sorted().collect::<Vec<_>>()))
+            .map(|(k, v)| (k, v.iter().sorted().collect_vec()))
             .sorted()
-            .collect::<Vec<_>>()
+            .collect_vec()
     }
 
     /// Create the rebase plan. Returns `None` if there were no commands in the rebase plan.
@@ -611,8 +630,23 @@ impl<'repo> RebasePlanBuilder<'repo> {
             dump_rebase_plan,
             detect_duplicate_commits_via_patch_id,
         } = options;
+        let constraint_graph: HashMap<NonZeroOid, HashSet<NonZeroOid>> = self
+            .initial_constraints
+            .iter()
+            .map(|constraint| match constraint {
+                Constraint::ImmediateChild {
+                    parent_oid,
+                    child_oid,
+                }
+                | Constraint::ChildAndDescendants {
+                    parent_oid,
+                    child_oid,
+                } => (*parent_oid, *child_oid),
+            })
+            .into_grouping_map()
+            .collect();
         let mut state = BuildState {
-            constraints: self.initial_constraints.clone(),
+            constraint_graph,
             commits_to_move: Default::default(), // filled in by `add_descendant_constraints`
             used_labels: Default::default(),
             merge_commit_parent_labels: Default::default(),
@@ -711,7 +745,7 @@ impl<'repo> RebasePlanBuilder<'repo> {
             })
             .collect();
         let missing_commit_oids: HashSet<NonZeroOid> = state
-            .constraints
+            .constraint_graph
             .values()
             .flatten()
             .copied()
@@ -749,7 +783,7 @@ impl<'repo> RebasePlanBuilder<'repo> {
             Some(merge_base_oid) => merge_base_oid,
         };
 
-        let touched_commit_oids = state.constraints.values().flatten().copied().collect();
+        let touched_commit_oids = state.constraint_graph.values().flatten().copied().collect();
 
         let path = self
             .dag
